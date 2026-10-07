@@ -1,0 +1,97 @@
+# Candidate builds only. No public GitHub Release, tags, deployment or signing secrets.
+# This product directory must be the root of the standalone source repository.
+name: Manual candidate builds
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: candidate-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Unsigned candidate (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: macos-latest
+            platform: macos
+    env:
+      CI: 'true'
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      PACKAGE_PLATFORM: ${{ matrix.platform }}
+    steps:
+      - name: Checkout product source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Build complete Windows ZIP (includes check; no installer)
+        if: matrix.platform == 'windows'
+        run: npm run dist:win
+      - name: Build macOS DMG and ZIP on a Mac (includes check)
+        if: matrix.platform == 'macos'
+        run: npm run dist:mac
+      - name: Verify candidate file set and generate checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $workspacePath = (Resolve-Path -LiteralPath $env:GITHUB_WORKSPACE).Path
+          $releasePath = (Resolve-Path -LiteralPath (Join-Path $workspacePath 'release')).Path
+          $expectedPath = [IO.Path]::GetFullPath((Join-Path $workspacePath 'release'))
+          if ($releasePath -ne $expectedPath) { throw 'Unexpected artifact output path' }
+          $outputItem = Get-Item -LiteralPath $releasePath -Force
+          if ($outputItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Artifact output must not be a link' }
+          $files = @(Get-ChildItem -LiteralPath $releasePath -File | Where-Object { $_.Extension -in '.zip', '.dmg' } | Sort-Object Name)
+          if ($files.Count -eq 0) { throw 'No candidate packages were produced' }
+          if (-not ($files | Where-Object Extension -eq '.zip')) { throw 'Missing complete application ZIP' }
+          if ($env:PACKAGE_PLATFORM -eq 'macos' -and -not ($files | Where-Object Extension -eq '.dmg')) { throw 'Missing macOS DMG' }
+          $checksums = foreach ($file in $files) {
+            if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Candidate packages must not be links' }
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($file.Name)"
+          }
+          $checksums | Set-Content -LiteralPath (Join-Path $releasePath 'SHA256SUMS.txt') -Encoding utf8
+          $version = (Get-Content -LiteralPath (Join-Path $workspacePath 'package.json') -Raw | ConvertFrom-Json).version
+          $buildInfo = @(
+            "Product: Mosslight $version"
+            "Commit: $env:GITHUB_SHA"
+            "Ref: $env:GITHUB_REF"
+            "Platform target: $env:PACKAGE_PLATFORM"
+            "Runner OS: $env:RUNNER_OS"
+            "Runner architecture: $env:RUNNER_ARCH"
+            "Node: $(node --version)"
+            "npm: $(npm --version)"
+            "Workflow run: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            'Status: candidate only; no trusted signing or notarization configured; desktop validation still required.'
+          )
+          $buildInfo | Set-Content -LiteralPath (Join-Path $releasePath 'BUILD_INFO.txt') -Encoding utf8
+      - name: Store candidate packages only (not a public Release)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: Mosslight-candidate-${{ matrix.platform }}-${{ github.sha }}
+          path: |
+            release/*.zip
+            release/*.dmg
+            release/SHA256SUMS.txt
+            release/BUILD_INFO.txt
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 14
+          compression-level: 0
